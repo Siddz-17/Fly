@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment Variables & Tokens
+.env
+.env.*
+!.env.example
+
+# Large Connectome Raw Datasets (> 100 MB)
+# (Local feather extracts from Janelia MaleCNS)
+data/raw/malecns/
+*.feather
+*.h5
+*.nrrd
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

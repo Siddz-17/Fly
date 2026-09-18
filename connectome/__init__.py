@@ -1,0 +1,3 @@
+"""
+Connectome package initialization.
+"""
