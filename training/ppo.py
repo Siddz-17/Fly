@@ -17,6 +17,7 @@ Pure NumPy vectorized implementation:
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 import numpy as np
 
@@ -90,11 +91,34 @@ class ActorCriticNetwork:
         action_clipped = np.clip(action, -1.0, 1.0)
         return action_clipped, float(log_prob), val
 
-    def compute_log_prob(self, state: np.ndarray, action: np.ndarray) -> float:
-        mu, log_std, _ = self.forward(state)
-        std = np.exp(log_std)
-        var = std**2
-        return -0.5 * float(np.sum(((action - mu)**2) / var + 2.0 * log_std + np.log(2.0 * math.pi)))
+    def save_checkpoint(self, filepath: str | Path) -> None:
+        """Save network parameters to an .npz checkpoint."""
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            filepath,
+            w1=self.w1,
+            b1=self.b1,
+            w_actor=self.w_actor,
+            b_actor=self.b_actor,
+            log_std=self.log_std,
+            w_critic=self.w_critic,
+            b_critic=self.b_critic,
+        )
+
+    def load_checkpoint(self, filepath: str | Path) -> None:
+        """Load network parameters from an .npz checkpoint."""
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"Checkpoint {filepath} not found.")
+        data = np.load(filepath)
+        self.w1[:] = data["w1"]
+        self.b1[:] = data["b1"]
+        self.w_actor[:] = data["w_actor"]
+        self.b_actor[:] = data["b_actor"]
+        self.log_std[:] = data["log_std"]
+        self.w_critic[:] = data["w_critic"]
+        self.b_critic[:] = data["b_critic"]
 
     def update_adam(self, grads: list[np.ndarray], lr: float = 3e-4, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8):
         self.t_opt += 1
