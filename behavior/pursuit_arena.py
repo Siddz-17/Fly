@@ -96,13 +96,14 @@ class PursuitArena:
         self.fly_pos = np.array([0.0, 0.0], dtype=float)
         self.fly_heading = self.rng.uniform(0, 2.0 * math.pi)
 
-        # Spawn target at distance 25-40 units away
-        dist = self.rng.uniform(25.0, 40.0)
+        # Spawn target at distance 18-28 units away (well inside arena boundaries)
+        dist = self.rng.uniform(18.0, 28.0)
         angle = self.rng.uniform(0, 2.0 * math.pi)
         self.target_pos = np.array([dist * math.cos(angle), dist * math.sin(angle)], dtype=float)
 
-        # Target moving along sinusoidal / wandering trajectory
-        target_heading = self.rng.uniform(0, 2.0 * math.pi)
+        # Direct initial velocity inward / tangential so target stays in bounds
+        radial_angle = angle + math.pi
+        target_heading = radial_angle + self.rng.uniform(-math.pi / 3.0, math.pi / 3.0)
         self.target_vel = np.array([
             self.target_speed * math.cos(target_heading),
             self.target_speed * math.sin(target_heading),
@@ -136,6 +137,24 @@ class PursuitArena:
             "obstacles": [obs.pos.copy() for obs in self.obstacles],
         }
         return fused_state.features, info
+
+    def respawn_target(self, min_dist: float = 22.0) -> None:
+        """Respawns target at a new interior position inside arena bounds away from fly."""
+        for _ in range(30):
+            cand_pos = self.rng.uniform(-30.0, 30.0, size=2)
+            if np.linalg.norm(cand_pos - self.fly_pos) >= min_dist:
+                self.target_pos = cand_pos.astype(float)
+                break
+        else:
+            self.target_pos = np.array([25.0, 0.0], dtype=float)
+
+        angle_to_center = math.atan2(-self.target_pos[1], -self.target_pos[0])
+        heading = angle_to_center + self.rng.uniform(-math.pi / 3.0, math.pi / 3.0)
+        self.target_vel = np.array([
+            self.target_speed * math.cos(heading),
+            self.target_speed * math.sin(heading),
+        ], dtype=float)
+        self.prev_distance = float(np.linalg.norm(self.target_pos - self.fly_pos))
 
     def _render_and_fuse(self) -> FusedAgentState:
         # Relative vector from fly to target
@@ -204,14 +223,56 @@ class PursuitArena:
         self.fly_pos[0] += forward_speed * math.cos(self.fly_heading) * self.dt_s
         self.fly_pos[1] += forward_speed * math.sin(self.fly_heading) * self.dt_s
 
-        # Update target motion (smooth wandering)
+        # Arena boundary containment for fly (clamped within walls)
+        fly_bound = self.arena_size * 0.44
+        for axis in (0, 1):
+            if abs(self.fly_pos[axis]) > fly_bound:
+                self.fly_pos[axis] = np.sign(self.fly_pos[axis]) * fly_bound
+
+        # Update target motion with smooth wandering, soft boundary repulsion, and obstacle avoidance
+        target_bound = self.arena_size * 0.43
+        soft_zone = self.arena_size * 0.32
+
+        # 1. Wandering heading
         target_heading = math.atan2(self.target_vel[1], self.target_vel[0])
-        target_heading += self.rng.normal(0.0, 0.1)
-        self.target_vel = np.array([
-            self.target_speed * math.cos(target_heading),
-            self.target_speed * math.sin(target_heading),
-        ], dtype=float)
+        target_heading += self.rng.normal(0.0, 0.12)
+
+        # 2. Wall repulsion forces (smoothly steer inward toward center when near borders)
+        steer_x = 0.0
+        steer_y = 0.0
+        if abs(self.target_pos[0]) > soft_zone:
+            excess = (abs(self.target_pos[0]) - soft_zone) / (target_bound - soft_zone)
+            steer_x -= np.sign(self.target_pos[0]) * excess * 2.5
+        if abs(self.target_pos[1]) > soft_zone:
+            excess = (abs(self.target_pos[1]) - soft_zone) / (target_bound - soft_zone)
+            steer_y -= np.sign(self.target_pos[1]) * excess * 2.5
+
+        # 3. Obstacle avoidance forces (prey swerves around obstacles)
+        for obs in self.obstacles:
+            diff_obs = self.target_pos - obs.pos
+            d_obs = float(np.linalg.norm(diff_obs))
+            safe_dist = obs.radius + 6.0
+            if d_obs < safe_dist and d_obs > 1e-4:
+                repel = (safe_dist - d_obs) / safe_dist
+                steer_x += (diff_obs[0] / d_obs) * repel * 3.0
+                steer_y += (diff_obs[1] / d_obs) * repel * 3.0
+
+        # Blend wandering vector with steering
+        desired_vx = self.target_speed * math.cos(target_heading) + steer_x * self.target_speed
+        desired_vy = self.target_speed * math.sin(target_heading) + steer_y * self.target_speed
+        speed_norm = math.hypot(desired_vx, desired_vy)
+        if speed_norm > 1e-4:
+            self.target_vel = np.array([desired_vx, desired_vy]) / speed_norm * self.target_speed
+
         self.target_pos += self.target_vel * self.dt_s
+
+        # 4. Hard elastic reflection at walls (absolute boundary containment guarantee)
+        if abs(self.target_pos[0]) >= target_bound:
+            self.target_pos[0] = np.sign(self.target_pos[0]) * target_bound
+            self.target_vel[0] = -abs(self.target_vel[0]) * np.sign(self.target_pos[0])
+        if abs(self.target_pos[1]) >= target_bound:
+            self.target_pos[1] = np.sign(self.target_pos[1]) * target_bound
+            self.target_vel[1] = -abs(self.target_vel[1]) * np.sign(self.target_pos[1])
 
         # Check distance to obstacles and resolve surface collisions
         min_obstacle_dist = 999.0

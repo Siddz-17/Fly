@@ -90,6 +90,10 @@ class LiveArenaViewer:
         self.mouse_pos: Optional[Tuple[int, int]] = None
         self.fly_trail: list[Tuple[int, int]] = []
         self.target_trail: list[Tuple[int, int]] = []
+        self.captures = 0
+        self.capture_flash = 0
+        self.last_capture_pos: Optional[Tuple[int, int]] = None
+        self.dragged_obs_idx: Optional[int] = None
 
         # Reset environment
         self.reset()
@@ -108,6 +112,9 @@ class LiveArenaViewer:
         cy = (self.height // 2)
         sx = int(cx + pos[0] * scale)
         sy = int(cy - pos[1] * scale)  # Invert Y for screen coords
+        # Clamp to arena screen region
+        sx = max(10, min(self.arena_px - 10, sx))
+        sy = max(10, min(self.height - 10, sy))
         return sx, sy
 
     def screen_to_world(self, sx: int, sy: int) -> np.ndarray:
@@ -134,11 +141,14 @@ class LiveArenaViewer:
         if target_vis:
             # Policy tracking when target is locked in visual field
             action_mean, log_std, value = self.policy.forward(obs)
-            turn_target = float(action_mean[0])
-            speed_target = float(np.clip(action_mean[1], 0.4, 1.0))
+            # Active visual slip compensation (Drosophila head-yaw fixation reflex)
+            target_x = float(state_info.target_pos[0]) if state_info else 0.0
+            vis_centering = float(np.clip(target_x * 1.8, -1.0, 1.0))
+            turn_target = float(np.clip(0.35 * action_mean[0] + 0.65 * vis_centering, -1.0, 1.0))
+            speed_target = float(np.clip(max(0.75, action_mean[1]), 0.6, 1.0))
         else:
             # Saccadic re-orientation toward target bearing
-            turn_target = float(np.clip(body_target_angle / math.radians(30.0), -1.0, 1.0))
+            turn_target = float(np.clip(body_target_angle / math.radians(25.0), -1.0, 1.0))
             speed_target = 0.85
 
         # 2. Biological Looming & Obstacle Avoidance Reflex
@@ -159,7 +169,7 @@ class LiveArenaViewer:
                 if abs(rel_angle) < math.radians(75.0):
                     is_avoiding = True
                     # Repulsive torque inversely proportional to distance
-                    strength = 2.4 * (1.0 - surface_dist / 18.0)
+                    strength = 2.5 * (1.0 - surface_dist / 18.0)
                     steering_dir = -1.0 if rel_angle >= 0.0 else 1.0
                     avoid_turn += steering_dir * strength
 
@@ -182,6 +192,9 @@ class LiveArenaViewer:
         self.total_reward += reward
         self.step_count += 1
 
+        if self.capture_flash > 0:
+            self.capture_flash -= 1
+
         # Move obstacles if enabled
         if self.moving_obstacles:
             for obs in self.env.obstacles:
@@ -199,7 +212,15 @@ class LiveArenaViewer:
         if len(self.target_trail) > 80:
             self.target_trail.pop(0)
 
-        if term or trunc:
+        if term:
+            # Target captured! Seamless continuous respawn without interrupting simulation
+            self.captures += 1
+            self.capture_flash = 12
+            self.last_capture_pos = self.world_to_screen(self.env.fly_pos)
+            self.env.respawn_target(min_dist=24.0)
+            self.target_trail.clear()
+            self.last_info["captured"] = True
+        elif trunc:
             time.sleep(0.3)
             self.reset()
 
@@ -222,9 +243,9 @@ class LiveArenaViewer:
             cv2.line(frame, (gx, cy - int(45 * scale)), (gx, cy + int(45 * scale)), (25, 30, 42), 1)
             cv2.line(frame, (cx - int(45 * scale), gy), (cx + int(45 * scale), gy), (25, 30, 42), 1)
 
-        # Arena boundary wall
-        tl = self.world_to_screen(np.array([-48.0, 48.0]))
-        br = self.world_to_screen(np.array([48.0, -48.0]))
+        # Arena boundary wall (matches target_bound and fly_bound)
+        tl = self.world_to_screen(np.array([-44.0, 44.0]))
+        br = self.world_to_screen(np.array([44.0, -44.0]))
         cv2.rectangle(frame, tl, br, (70, 85, 110), 2)
 
         # Draw Target Trail
@@ -285,21 +306,33 @@ class LiveArenaViewer:
         cv2.fillPoly(frame, [np.array([f_nose, f_lwing, f_rwing], np.int32)], (240, 180, 50))
         cv2.polylines(frame, [np.array([f_nose, f_lwing, f_rwing], np.int32)], True, (255, 255, 255), 1)
 
+        # Capture Celebration Ripple
+        if self.capture_flash > 0 and self.last_capture_pos is not None:
+            c_rad = int((12 - self.capture_flash) * 5 + 16)
+            cv2.circle(frame, self.last_capture_pos, c_rad, (50, 255, 120), 2)
+            cv2.circle(frame, self.last_capture_pos, max(4, c_rad - 8), (100, 255, 180), 1)
+            cv2.putText(frame, "+100 CAPTURED!", (self.last_capture_pos[0] - 60, self.last_capture_pos[1] - c_rad - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (60, 255, 140), 2)
+
         # -------------------------------------------------------------
         # 2. RIGHT PANEL: CONNECTOME COCKPIT & PERCEPTION HUD
         # -------------------------------------------------------------
         hx = self.arena_px + 20
         hy = 35
 
-        # Title
+        # Title & Capture Metric
         cv2.putText(frame, "CONNECTOME PERCEPTION COCKPIT", (hx, hy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 245, 255), 2)
         cv2.putText(frame, "Real male-cns:v1.0 (891 neurons, 6152 syn)", (hx, hy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 160, 190), 1)
         cv2.line(frame, (hx, hy + 28), (self.width - 20, hy + 28), (45, 55, 75), 1)
 
+        # Interceptions counter
+        cv2.putText(frame, f"INTERCEPTIONS: {self.captures}", (hx, hy + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 255, 120), 2)
+        cv2.putText(frame, f"OBSTACLES: {len(self.env.obstacles)}", (hx + 240, hy + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 215, 235), 1)
+
         # A. Status Banner
-        hy = 85
+        hy = 115
         is_avoid = self.last_info.get("is_avoiding", False)
-        captured = self.last_info.get("captured", False)
+        captured = self.last_info.get("captured", False) or (self.capture_flash > 0)
         collided = self.last_info.get("collided", False)
 
         if collided:
@@ -318,36 +351,32 @@ class LiveArenaViewer:
         cv2.putText(frame, status_text, (hx, hy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
 
         # B. Distance & Telemetry Gauges
-        hy = 120
+        hy = 150
         dist_target = self.last_info.get("distance", 0.0)
         min_obs = self.last_info.get("min_obstacle_dist", 999.0)
 
         cv2.putText(frame, f"Distance to Target: {dist_target:.1f} m", (hx, hy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 210, 230), 1)
-        # Target distance bar
         bar_w = int(np.clip(dist_target * 4.0, 10, 220))
         cv2.rectangle(frame, (hx, hy + 8), (hx + 220, hy + 18), (30, 40, 55), -1)
         cv2.rectangle(frame, (hx, hy + 8), (hx + bar_w, hy + 18), (50, 210, 100), -1)
 
         hy += 45
         cv2.putText(frame, f"Nearest Obstacle: {min_obs:.1f} m", (hx, hy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 210, 230), 1)
-        # Obstacle proximity bar (Red = danger close, Amber = hazard, Green = clear)
         obs_bar_w = int(np.clip((30.0 - min_obs) * 7.3, 0, 220)) if min_obs < 30.0 else 0
         obs_color = (0, 0, 230) if min_obs < 8.0 else ((0, 160, 255) if min_obs < 16.0 else (80, 140, 80))
         cv2.rectangle(frame, (hx, hy + 8), (hx + 220, hy + 18), (30, 40, 55), -1)
         cv2.rectangle(frame, (hx, hy + 8), (hx + obs_bar_w, hy + 18), obs_color, -1)
 
         # C. Ommatidia Retinal Array (Fly's Eye View)
-        hy = 210
+        hy = 230
         cv2.putText(frame, "FLY RETINA: 25-Column Hex Receptive Fields", (hx, hy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 230, 245), 1)
         cv2.line(frame, (hx, hy + 6), (self.width - 20, hy + 6), (40, 50, 70), 1)
 
-        # Draw 25 ommatidia hex layout
         retina_cx = hx + 100
-        retina_cy = hy + 80
+        retina_cy = hy + 65
         state_info = self.last_info.get("state_info")
         target_vis = state_info.target_visible if state_info else False
 
-        # Visual spot location on retina
         u_pts = np.linspace(-20, 20, 5)
         v_pts = np.linspace(-20, 20, 5)
         for u in u_pts:
@@ -355,18 +384,17 @@ class LiveArenaViewer:
                 rx = int(retina_cx + u * 3.5 + v * 1.7)
                 ry = int(retina_cy + v * 3.0)
 
-                # Light up receptive field if target or obstacle is in view
                 receptive_color = (40, 45, 60)
                 if min_obs < 16.0 and abs(u) < 12 and abs(v) < 12:
-                    receptive_color = (0, 120, 220)  # Obstacle looming activation
+                    receptive_color = (0, 120, 220)
                 if target_vis and abs(u) < 8 and abs(v) < 8:
-                    receptive_color = (40, 220, 100)  # Target detection
+                    receptive_color = (40, 220, 100)
 
                 cv2.circle(frame, (rx, ry), 7, receptive_color, -1)
                 cv2.circle(frame, (rx, ry), 7, (70, 80, 100), 1)
 
         # D. Connectome Motion Vector & Looming Gauge
-        hy = 340
+        hy = 345
         cv2.putText(frame, "CONNECTOME MOTION & FLOW TELEMETRY", (hx, hy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 230, 245), 1)
         cv2.line(frame, (hx, hy + 6), (self.width - 20, hy + 6), (40, 50, 70), 1)
 
@@ -378,7 +406,6 @@ class LiveArenaViewer:
         cv2.putText(frame, f"Optic Flow Vx: {vx:+.2f} | Vy: {vy:+.2f}", (hx, hy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 200, 220), 1)
         cv2.putText(frame, f"Looming Expansion (div V): {loom:+.2e}", (hx, hy + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 200, 220), 1)
 
-        # Draw motion vector compass
         compass_x = self.width - 90
         compass_y = hy + 10
         cv2.circle(frame, (compass_x, compass_y), 24, (30, 40, 55), -1)
@@ -394,30 +421,62 @@ class LiveArenaViewer:
         cv2.putText(frame, f"Forward Thrust: {act[1]:.2f} (Speed: {act[1] * self.env.fly_speed:.1f})", (hx, hy + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 215, 235), 1)
 
         # F. Interactive Help Bar
-        hy = 530
-        cv2.rectangle(frame, (hx - 10, hy), (self.width - 15, self.height - 20), (25, 32, 45), -1)
-        cv2.rectangle(frame, (hx - 10, hy), (self.width - 15, self.height - 20), (50, 65, 85), 1)
+        hy = 525
+        cv2.rectangle(frame, (hx - 10, hy), (self.width - 15, self.height - 15), (25, 32, 45), -1)
+        cv2.rectangle(frame, (hx - 10, hy), (self.width - 15, self.height - 15), (50, 65, 85), 1)
 
-        cv2.putText(frame, "INTERACTIVE CONTROLS:", (hx, hy + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 255), 1)
-        cv2.putText(frame, "* LEFT-CLICK: Place/Drop obstacle at cursor!", (hx, hy + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 255), 1)
-        cv2.putText(frame, "* [SPACE]: Pause / Resume simulation", (hx, hy + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 195, 215), 1)
-        cv2.putText(frame, "* [O]: Toggle moving vs static obstacles", (hx, hy + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 195, 215), 1)
-        cv2.putText(frame, "* [R]: Reset episode  |  [Q/ESC]: Quit", (hx, hy + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 195, 215), 1)
+        cv2.putText(frame, "INTERACTIVE CONTROLS:", (hx, hy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 255), 1)
+        cv2.putText(frame, "* LEFT-CLICK: Drag obstacle or click empty space to add", (hx, hy + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 220, 255), 1)
+        cv2.putText(frame, "* RIGHT-CLICK: Delete obstacle under cursor", (hx, hy + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 190, 255), 1)
+        cv2.putText(frame, "* [C]: Clear all obstacles  |  [O]: Toggle moving obstacles", (hx, hy + 74), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 195, 215), 1)
+        cv2.putText(frame, "* [SPACE]: Pause / Resume   |  [R]: Reset  |  [Q/ESC]: Quit", (hx, hy + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 195, 215), 1)
 
         return frame
 
     def on_mouse(self, event, x, y, flags, param):
-        """Allow user to click anywhere on the arena to place or drag an obstacle."""
-        if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON)):
-            if x < self.arena_px - 40:
-                world_pos = self.screen_to_world(x, y)
-                if len(self.env.obstacles) > 0:
-                    # Move closest obstacle to cursor
+        """Interactive mouse callback:
+        - Left click/drag on obstacle: Move obstacle.
+        - Left click on empty space: Add new obstacle.
+        - Right click: Delete obstacle.
+        """
+        if x >= self.arena_px - 20:
+            return
+
+        world_pos = self.screen_to_world(x, y)
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Check if clicked near existing obstacle
+            hit_idx = None
+            for idx, obs in enumerate(self.env.obstacles):
+                sx, sy = self.world_to_screen(obs.pos)
+                if math.hypot(x - sx, y - sy) <= 30:
+                    hit_idx = idx
+                    break
+
+            if hit_idx is not None:
+                self.dragged_obs_idx = hit_idx
+                self.env.obstacles[hit_idx].pos = world_pos
+            else:
+                if len(self.env.obstacles) < 8:
+                    self.env.obstacles.append(ArenaObstacle(pos=world_pos, radius=self.env.obstacle_radius))
+                elif len(self.env.obstacles) > 0:
                     dists = [np.linalg.norm(obs.pos - world_pos) for obs in self.env.obstacles]
                     closest_idx = int(np.argmin(dists))
                     self.env.obstacles[closest_idx].pos = world_pos
-                else:
-                    self.env.obstacles.append(ArenaObstacle(pos=world_pos, radius=self.env.obstacle_radius))
+
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if self.dragged_obs_idx is not None and self.dragged_obs_idx < len(self.env.obstacles):
+                self.env.obstacles[self.dragged_obs_idx].pos = world_pos
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.dragged_obs_idx = None
+
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            for idx, obs in enumerate(self.env.obstacles):
+                sx, sy = self.world_to_screen(obs.pos)
+                if math.hypot(x - sx, y - sy) <= 30:
+                    self.env.obstacles.pop(idx)
+                    break
 
     def run(self):
         cv2.namedWindow("Fly Connectome: Real-Time Obstacle Avoidance Pursuit", cv2.WINDOW_AUTOSIZE)
@@ -426,7 +485,9 @@ class LiveArenaViewer:
         print("\n============================================================")
         print("  FLY CONNECTOME: REAL-TIME OBSTACLE AVOIDANCE PURSUIT")
         print("============================================================")
-        print("  - Left-Click anywhere in the arena to place/move obstacles!")
+        print("  - Left-Click / Drag: Move obstacles or place new ones")
+        print("  - Right-Click: Delete obstacle under cursor")
+        print("  - Press [C] to Clear all obstacles")
         print("  - Press [SPACE] to Pause / Resume")
         print("  - Press [O] to toggle moving obstacles")
         print("  - Press [R] to Reset Episode")
@@ -449,6 +510,9 @@ class LiveArenaViewer:
                 self.paused = not self.paused
             elif key in (ord('r'), ord('R')):
                 self.reset()
+            elif key in (ord('c'), ord('C')):
+                self.env.obstacles.clear()
+                print("[VIEWER] Cleared all obstacles.")
             elif key in (ord('o'), ord('O')):
                 self.moving_obstacles = not self.moving_obstacles
                 print(f"[VIEWER] Moving obstacles: {self.moving_obstacles}")
