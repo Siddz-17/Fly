@@ -13,6 +13,7 @@ A visual pursuit simulation environment interfacing:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from typing import Any, Dict, Optional, Tuple
 import numpy as np
@@ -24,9 +25,18 @@ from vision.transduction import RetinotopicTransducer
 from vision.yolo_interface import YOLOInterface
 
 
+@dataclass
+class ArenaObstacle:
+    """An obstacle in the pursuit arena."""
+    pos: np.ndarray             # (2,) [x, y] coordinates
+    radius: float = 6.0         # Spatial radius
+    vel: np.ndarray = None      # (2,) velocity (optional motion)
+
+
 class PursuitArena:
     """
-    Continuous 2D visual pursuit arena where the fly tracks and pursues a moving target.
+    Continuous 2D visual pursuit arena where the fly tracks and pursues a moving target
+    while detecting and negotiating obstacles via the connectome vision pipeline.
     """
 
     def __init__(
@@ -41,6 +51,8 @@ class PursuitArena:
         target_speed: float = 10.0,
         capture_radius: float = 5.0,
         fov_deg: float = 40.0,
+        n_obstacles: int = 0,
+        obstacle_radius: float = 6.0,
         random_seed: int = 42,
     ):
         self.arena_size = arena_size
@@ -51,6 +63,8 @@ class PursuitArena:
         self.target_speed = target_speed
         self.capture_radius = capture_radius
         self.fov_deg = fov_deg
+        self.n_obstacles = n_obstacles
+        self.obstacle_radius = obstacle_radius
         self.rng = np.random.default_rng(random_seed)
 
         # Connectome vision pipeline
@@ -67,6 +81,9 @@ class PursuitArena:
         # Target state: [x, y, vx, vy]
         self.target_pos = np.zeros(2, dtype=float)
         self.target_vel = np.zeros(2, dtype=float)
+
+        # Obstacles list
+        self.obstacles: list[ArenaObstacle] = []
 
         self.step_count = 0
         self.prev_distance = 0.0
@@ -91,12 +108,26 @@ class PursuitArena:
             self.target_speed * math.sin(target_heading),
         ], dtype=float)
 
+        # Spawn obstacles if requested
+        self.obstacles = []
+        for _ in range(self.n_obstacles):
+            # Place obstacle in the corridor between fly and target
+            t = float(self.rng.uniform(0.3, 0.7))
+            mid = self.fly_pos * (1.0 - t) + self.target_pos * t
+            jitter = self.rng.normal(0.0, 5.0, size=2)
+            obs_pos = mid + jitter
+            self.obstacles.append(ArenaObstacle(pos=obs_pos, radius=self.obstacle_radius))
+
         self.step_count = 0
         self.prev_distance = float(np.linalg.norm(self.target_pos - self.fly_pos))
         self.sim.reset()
 
         fused_state = self._render_and_fuse()
-        return fused_state.features, {"state_info": fused_state}
+        info = {
+            "state_info": fused_state,
+            "obstacles": [obs.pos.copy() for obs in self.obstacles],
+        }
+        return fused_state.features, info
 
     def _render_and_fuse(self) -> FusedAgentState:
         # Relative vector from fly to target
@@ -108,22 +139,31 @@ class PursuitArena:
         body_angle = (global_angle - self.fly_heading + math.pi) % (2.0 * math.pi) - math.pi
         body_angle_deg = math.degrees(body_angle)
 
-        # 1. YOLO Detection
+        # 1. YOLO Detection (target)
         yolo_dets = self.yolo.detect_from_arena_state(
             target_pos_deg=(body_angle_deg, 0.0),
             target_size_deg=6.0,
             field_of_view_deg=self.fov_deg,
         )
 
-        # 2. Render visual scene into ommatidia array
-        # Moving bright spot in visual angles (azimuth)
-        v_azimuth = math.degrees(self.target_vel[1] / max(1.0, rel_dist))  # Angular velocity
-
+        # 2. Render visual scene into ommatidia array (Target + Obstacles)
         def scene_fn(x: np.ndarray, y: np.ndarray, t_ms: float) -> np.ndarray:
             dist_azimuth = np.abs(x - body_angle_deg)
             dist_elevation = np.abs(y)
-            in_spot = (dist_azimuth**2 + dist_elevation**2) <= (3.0**2)
-            return in_spot.astype(float)
+            in_target = (dist_azimuth**2 + dist_elevation**2) <= (3.0**2)
+            lum = in_target.astype(float)
+
+            # Render any obstacle in visual field
+            for obs in self.obstacles:
+                rel_obs = obs.pos - self.fly_pos
+                obs_dist = np.linalg.norm(rel_obs)
+                obs_angle = (math.atan2(rel_obs[1], rel_obs[0]) - self.fly_heading + math.pi) % (2.0 * math.pi) - math.pi
+                obs_angle_deg = math.degrees(obs_angle)
+                angular_radius = math.degrees(math.atan2(obs.radius, max(1.0, obs_dist)))
+                in_obs = ((x - obs_angle_deg)**2 + y**2) <= (angular_radius**2)
+                lum = np.maximum(lum, in_obs.astype(float) * 0.9)
+
+            return lum
 
         # One timestep of connectome simulation
         sample_input = self.transducer.sample_scene(scene_fn, 0.0)
@@ -165,6 +205,16 @@ class PursuitArena:
         ], dtype=float)
         self.target_pos += self.target_vel * self.dt_s
 
+        # Check distance to obstacles and collision
+        min_obstacle_dist = 999.0
+        collided = False
+        for obs in self.obstacles:
+            d = float(np.linalg.norm(obs.pos - self.fly_pos)) - obs.radius
+            if d < min_obstacle_dist:
+                min_obstacle_dist = d
+            if d <= 0.0:
+                collided = True
+
         self.step_count += 1
         current_distance = float(np.linalg.norm(self.target_pos - self.fly_pos))
 
@@ -180,7 +230,11 @@ class PursuitArena:
         alignment = float(np.dot(fly_dir, rel_dir))
         reward += alignment * 0.5
 
-        # 3. Small step penalty to encourage rapid pursuit
+        # 3. Collision penalty
+        if collided:
+            reward -= 20.0
+
+        # 4. Small step penalty to encourage rapid pursuit
         reward -= 0.1
 
         # Check termination:
@@ -197,8 +251,11 @@ class PursuitArena:
         info = {
             "distance": current_distance,
             "captured": captured,
+            "collided": collided,
+            "min_obstacle_dist": min_obstacle_dist,
             "step": self.step_count,
             "state_info": fused_state,
+            "obstacles": [obs.pos.copy() for obs in self.obstacles],
         }
 
         return fused_state.features, reward, terminated, truncated, info

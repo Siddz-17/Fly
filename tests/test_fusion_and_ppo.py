@@ -92,3 +92,21 @@ def test_ppo_network_and_trainer(circuit_data):
 
     mean_r = trainer.train_step(rollout, n_epochs=1)
     assert isinstance(mean_r, float)
+
+
+def test_pursuit_arena_obstacles(circuit_data):
+    """Verify obstacle initialization, collision detection, and distance metrics."""
+    env = PursuitArena(circuit_data, n_obstacles=3, obstacle_radius=6.0, max_steps=10)
+    obs, info = env.reset()
+    assert len(env.obstacles) == 3
+    assert "obstacles" in info
+    assert len(info["obstacles"]) == 3
+
+    # Step with forward movement
+    action = [0.0, 1.0]
+    next_obs, reward, term, trunc, step_info = env.step(action)
+    assert "min_obstacle_dist" in step_info
+    assert isinstance(step_info["min_obstacle_dist"], float)
+    assert "collided" in step_info
+    assert isinstance(step_info["collided"], bool)
+
