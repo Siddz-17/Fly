@@ -62,13 +62,15 @@ class LiveArenaViewer:
         with open(circuit_path, "r", encoding="utf-8") as f:
             self.circuit_data = json.load(f)
 
-        # Initialize arena with obstacles
+        # Initialize arena with obstacles and agile fly turning dynamics
         self.env = PursuitArena(
             self.circuit_data,
             fusion_mode=FusionMode.FULL,
             arena_size=100.0,
             max_steps=500,
             dt_s=0.05,
+            fly_speed=16.0,
+            fly_turn_rate_deg=180.0,
             n_obstacles=n_obstacles,
             obstacle_radius=obstacle_radius,
             random_seed=42,
@@ -121,45 +123,51 @@ class LiveArenaViewer:
         """
         Combines PPO target pursuit with biological looming-based collision avoidance.
         """
-        # 1. PPO pursuit policy action
-        action_mean, log_std, value = self.policy.forward(obs)
-        turn_ppo = float(action_mean[0])
-        speed_ppo = float(np.clip(action_mean[1], 0.3, 1.0))
+        # 1. Target relative orientation
+        rel_target = self.env.target_pos - self.env.fly_pos
+        global_target_angle = math.atan2(rel_target[1], rel_target[0])
+        body_target_angle = (global_target_angle - self.env.fly_heading + math.pi) % (2.0 * math.pi) - math.pi
 
-        # Active visual search if target is not visible
         state_info = self.last_info.get("state_info")
         target_vis = state_info.target_visible if state_info else False
-        if not target_vis:
-            turn_ppo = 0.75  # active scanning saccade
+
+        if target_vis:
+            # Policy tracking when target is locked in visual field
+            action_mean, log_std, value = self.policy.forward(obs)
+            turn_target = float(action_mean[0])
+            speed_target = float(np.clip(action_mean[1], 0.4, 1.0))
+        else:
+            # Saccadic re-orientation toward target bearing
+            turn_target = float(np.clip(body_target_angle / math.radians(30.0), -1.0, 1.0))
+            speed_target = 0.85
 
         # 2. Biological Looming & Obstacle Avoidance Reflex
-        # In Drosophila, visual looming expansion triggers a strong steering saccade
         avoid_turn = 0.0
         min_dist = 999.0
-        closest_obs = None
+        is_avoiding = False
 
         for obs_item in self.env.obstacles:
             rel = obs_item.pos - self.env.fly_pos
-            d = float(np.linalg.norm(rel)) - obs_item.radius
-            if d < min_dist:
-                min_dist = d
-                closest_obs = obs_item
+            dist_to_center = float(np.linalg.norm(rel))
+            surface_dist = dist_to_center - obs_item.radius
+            if surface_dist < min_dist:
+                min_dist = surface_dist
 
-            # Check if obstacle is in forward flight path
-            if d < 18.0:
+            # Check if obstacle is ahead in the forward flight path
+            if surface_dist < 18.0:
                 rel_angle = (math.atan2(rel[1], rel[0]) - self.env.fly_heading + math.pi) % (2.0 * math.pi) - math.pi
-                if abs(rel_angle) < math.radians(65.0):
-                    # Repulsive torque inversely proportional to distance squared
-                    strength = 1.8 * (1.0 - (d / 18.0))**2
+                if abs(rel_angle) < math.radians(75.0):
+                    is_avoiding = True
+                    # Repulsive torque inversely proportional to distance
+                    strength = 2.4 * (1.0 - surface_dist / 18.0)
                     steering_dir = -1.0 if rel_angle >= 0.0 else 1.0
                     avoid_turn += steering_dir * strength
 
-        # Combine pursuit and avoidance
-        total_turn = float(np.clip(turn_ppo + avoid_turn, -1.0, 1.0))
-        # Slow down slightly when in close hazard avoidance zone
-        speed = speed_ppo if min_dist > 10.0 else max(0.4, speed_ppo * 0.6)
+        # Combine target pursuit + obstacle avoidance
+        total_turn = float(np.clip(turn_target + avoid_turn, -1.0, 1.0))
+        speed = speed_target if min_dist > 8.0 else max(0.4, speed_target * 0.7)
 
-        return np.array([total_turn, speed], dtype=float), (min_dist < 16.0)
+        return np.array([total_turn, speed], dtype=float), is_avoiding
 
     def step(self):
         if self.paused:

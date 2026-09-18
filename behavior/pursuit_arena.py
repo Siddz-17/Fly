@@ -108,15 +108,23 @@ class PursuitArena:
             self.target_speed * math.sin(target_heading),
         ], dtype=float)
 
-        # Spawn obstacles if requested
+        # Spawn obstacles if requested, ensuring they do not spawn on top of fly or target
         self.obstacles = []
         for _ in range(self.n_obstacles):
-            # Place obstacle in the corridor between fly and target
-            t = float(self.rng.uniform(0.3, 0.7))
-            mid = self.fly_pos * (1.0 - t) + self.target_pos * t
-            jitter = self.rng.normal(0.0, 5.0, size=2)
-            obs_pos = mid + jitter
-            self.obstacles.append(ArenaObstacle(pos=obs_pos, radius=self.obstacle_radius))
+            for attempt in range(20):
+                # Place obstacle in the corridor between fly and target
+                t = float(self.rng.uniform(0.35, 0.75))
+                mid = self.fly_pos * (1.0 - t) + self.target_pos * t
+                jitter = self.rng.normal(0.0, 6.0, size=2)
+                obs_pos = mid + jitter
+                # Must be at least 15 units from fly and 10 units from target
+                if np.linalg.norm(obs_pos - self.fly_pos) >= (self.obstacle_radius + 8.0) and np.linalg.norm(obs_pos - self.target_pos) >= 8.0:
+                    self.obstacles.append(ArenaObstacle(pos=obs_pos, radius=self.obstacle_radius))
+                    break
+            else:
+                # Fallback offset
+                obs_pos = np.array([18.0, 10.0])
+                self.obstacles.append(ArenaObstacle(pos=obs_pos, radius=self.obstacle_radius))
 
         self.step_count = 0
         self.prev_distance = float(np.linalg.norm(self.target_pos - self.fly_pos))
@@ -205,15 +213,22 @@ class PursuitArena:
         ], dtype=float)
         self.target_pos += self.target_vel * self.dt_s
 
-        # Check distance to obstacles and collision
+        # Check distance to obstacles and resolve surface collisions
         min_obstacle_dist = 999.0
         collided = False
         for obs in self.obstacles:
-            d = float(np.linalg.norm(obs.pos - self.fly_pos)) - obs.radius
-            if d < min_obstacle_dist:
-                min_obstacle_dist = d
-            if d <= 0.0:
+            diff = self.fly_pos - obs.pos
+            dist = float(np.linalg.norm(diff))
+            surface_dist = dist - obs.radius
+            if surface_dist < min_obstacle_dist:
+                min_obstacle_dist = surface_dist
+            if surface_dist <= 0.0:
                 collided = True
+                # Elastic/sliding collision resolution: clamp fly outside obstacle radius
+                normal = diff / max(1e-6, dist)
+                self.fly_pos = obs.pos + normal * (obs.radius + 0.1)
+                # Deflect heading along surface tangent
+                self.fly_heading = (math.atan2(-normal[0], normal[1]) + math.pi) % (2.0 * math.pi) - math.pi
 
         self.step_count += 1
         current_distance = float(np.linalg.norm(self.target_pos - self.fly_pos))
