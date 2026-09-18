@@ -1,0 +1,5 @@
+condition,success_rate,mean_reward,mean_steps
+full,0.0,-284.68,120.0
+yolo_only,0.2,-131.58,112.2
+connectome_only,0.0,-297.36,120.0
+random_baseline,0.0,-245.19,120.0

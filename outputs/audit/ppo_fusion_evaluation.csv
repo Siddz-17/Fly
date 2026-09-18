@@ -1,0 +1,4 @@
+condition,initial_reward,final_reward,reward_gain
+full,-3.8,-2.17,1.63
+yolo_only,-3.34,-2.17,1.18
+connectome_only,-3.79,-2.16,1.62

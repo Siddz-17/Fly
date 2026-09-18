@@ -1,0 +1,204 @@
+"""
+behavior/pursuit_arena.py
+
+Milestone 9: Moving Target Pursuit Arena.
+
+A visual pursuit simulation environment interfacing:
+1. Continuous 2D arena with fly agent and moving target.
+2. Real-time visual projection into RetinotopicTransducer & Connectome.
+3. Object detection via YOLOInterface.
+4. State representation via StateFusionLayer.
+5. Standard Gym-compatible step() / reset() interface for reinforcement learning (PPO).
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Optional, Tuple
+import numpy as np
+
+from connectome.dynamics import CircuitDynamics, WeightNormalization
+from vision.embeddings import ConnectomeMotionExtractor, MotionEmbedding
+from vision.fusion import FusedAgentState, FusionMode, StateFusionLayer
+from vision.transduction import RetinotopicTransducer
+from vision.yolo_interface import YOLOInterface
+
+
+class PursuitArena:
+    """
+    Continuous 2D visual pursuit arena where the fly tracks and pursues a moving target.
+    """
+
+    def __init__(
+        self,
+        circuit_data: dict[str, Any],
+        fusion_mode: FusionMode = FusionMode.FULL,
+        arena_size: float = 100.0,
+        max_steps: int = 200,
+        dt_s: float = 0.05,
+        fly_speed: float = 15.0,
+        fly_turn_rate_deg: float = 45.0,
+        target_speed: float = 10.0,
+        capture_radius: float = 5.0,
+        fov_deg: float = 40.0,
+        random_seed: int = 42,
+    ):
+        self.arena_size = arena_size
+        self.max_steps = max_steps
+        self.dt_s = dt_s
+        self.fly_speed = fly_speed
+        self.fly_turn_rate = math.radians(fly_turn_rate_deg)
+        self.target_speed = target_speed
+        self.capture_radius = capture_radius
+        self.fov_deg = fov_deg
+        self.rng = np.random.default_rng(random_seed)
+
+        # Connectome vision pipeline
+        self.transducer = RetinotopicTransducer(circuit_data, dt_ms=dt_s * 1000.0)
+        self.sim = CircuitDynamics(circuit_data, normalization=WeightNormalization.COLUMN_NORM, dt_ms=dt_s * 1000.0)
+        self.motion_extractor = ConnectomeMotionExtractor(circuit_data)
+        self.yolo = YOLOInterface()
+        self.fusion = StateFusionLayer(mode=fusion_mode)
+
+        # Agent state: [x, y, theta]
+        self.fly_pos = np.zeros(2, dtype=float)
+        self.fly_heading = 0.0  # radians
+
+        # Target state: [x, y, vx, vy]
+        self.target_pos = np.zeros(2, dtype=float)
+        self.target_vel = np.zeros(2, dtype=float)
+
+        self.step_count = 0
+        self.prev_distance = 0.0
+
+    def reset(self, seed: Optional[int] = None) -> tuple[np.ndarray, dict[str, Any]]:
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+
+        # Spawn fly in center
+        self.fly_pos = np.array([0.0, 0.0], dtype=float)
+        self.fly_heading = self.rng.uniform(0, 2.0 * math.pi)
+
+        # Spawn target at distance 25-40 units away
+        dist = self.rng.uniform(25.0, 40.0)
+        angle = self.rng.uniform(0, 2.0 * math.pi)
+        self.target_pos = np.array([dist * math.cos(angle), dist * math.sin(angle)], dtype=float)
+
+        # Target moving along sinusoidal / wandering trajectory
+        target_heading = self.rng.uniform(0, 2.0 * math.pi)
+        self.target_vel = np.array([
+            self.target_speed * math.cos(target_heading),
+            self.target_speed * math.sin(target_heading),
+        ], dtype=float)
+
+        self.step_count = 0
+        self.prev_distance = float(np.linalg.norm(self.target_pos - self.fly_pos))
+        self.sim.reset()
+
+        fused_state = self._render_and_fuse()
+        return fused_state.features, {"state_info": fused_state}
+
+    def _render_and_fuse(self) -> FusedAgentState:
+        # Relative vector from fly to target
+        rel_pos = self.target_pos - self.fly_pos
+        rel_dist = np.linalg.norm(rel_pos)
+
+        # Target angle in fly's body frame
+        global_angle = math.atan2(rel_pos[1], rel_pos[0])
+        body_angle = (global_angle - self.fly_heading + math.pi) % (2.0 * math.pi) - math.pi
+        body_angle_deg = math.degrees(body_angle)
+
+        # 1. YOLO Detection
+        yolo_dets = self.yolo.detect_from_arena_state(
+            target_pos_deg=(body_angle_deg, 0.0),
+            target_size_deg=6.0,
+            field_of_view_deg=self.fov_deg,
+        )
+
+        # 2. Render visual scene into ommatidia array
+        # Moving bright spot in visual angles (azimuth)
+        v_azimuth = math.degrees(self.target_vel[1] / max(1.0, rel_dist))  # Angular velocity
+
+        def scene_fn(x: np.ndarray, y: np.ndarray, t_ms: float) -> np.ndarray:
+            dist_azimuth = np.abs(x - body_angle_deg)
+            dist_elevation = np.abs(y)
+            in_spot = (dist_azimuth**2 + dist_elevation**2) <= (3.0**2)
+            return in_spot.astype(float)
+
+        # One timestep of connectome simulation
+        sample_input = self.transducer.sample_scene(scene_fn, 0.0)
+        # External current into L1 (ON channel)
+        currents = np.zeros(self.sim.n_neurons)
+        for i, key in enumerate(self.transducer.ordered_keys):
+            om = self.transducer.ommatidia[key]
+            if om.l1_id is not None and om.l1_id in self.sim.bid_to_idx:
+                idx = self.sim.bid_to_idx[om.l1_id]
+                currents[idx] = sample_input[i] * 5.0
+
+        v, rates = self.sim.step(currents)
+        motion_emb = self.motion_extractor.extract_from_rates(rates)
+
+        # 3. Fuse YOLO + Connectome
+        fused = self.fusion.fuse(yolo_dets, motion_emb)
+        return fused
+
+    def step(self, action: np.ndarray | list[float]) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        """
+        Action: [turn_action, speed_action]
+        turn_action in [-1.0, +1.0] -> [-fly_turn_rate, +fly_turn_rate]
+        speed_action in [0.0, 1.0] -> [0.0, fly_speed]
+        """
+        turn = float(np.clip(action[0], -1.0, 1.0)) * self.fly_turn_rate
+        forward_speed = float(np.clip(action[1], 0.0, 1.0)) * self.fly_speed
+
+        # Update fly kinematics
+        self.fly_heading = (self.fly_heading + turn * self.dt_s) % (2.0 * math.pi)
+        self.fly_pos[0] += forward_speed * math.cos(self.fly_heading) * self.dt_s
+        self.fly_pos[1] += forward_speed * math.sin(self.fly_heading) * self.dt_s
+
+        # Update target motion (smooth wandering)
+        target_heading = math.atan2(self.target_vel[1], self.target_vel[0])
+        target_heading += self.rng.normal(0.0, 0.1)
+        self.target_vel = np.array([
+            self.target_speed * math.cos(target_heading),
+            self.target_speed * math.sin(target_heading),
+        ], dtype=float)
+        self.target_pos += self.target_vel * self.dt_s
+
+        self.step_count += 1
+        current_distance = float(np.linalg.norm(self.target_pos - self.fly_pos))
+
+        # Reward formulation:
+        # 1. Distance closing reward: +10 per unit distance decreased
+        distance_delta = self.prev_distance - current_distance
+        reward = distance_delta * 10.0
+
+        # 2. Orientation alignment reward (cosine of angle between heading and target)
+        rel_pos = self.target_pos - self.fly_pos
+        rel_dir = rel_pos / max(1e-6, current_distance)
+        fly_dir = np.array([math.cos(self.fly_heading), math.sin(self.fly_heading)])
+        alignment = float(np.dot(fly_dir, rel_dir))
+        reward += alignment * 0.5
+
+        # 3. Small step penalty to encourage rapid pursuit
+        reward -= 0.1
+
+        # Check termination:
+        captured = current_distance <= self.capture_radius
+        if captured:
+            reward += 100.0  # Capture bonus
+
+        terminated = captured
+        truncated = self.step_count >= self.max_steps
+
+        self.prev_distance = current_distance
+        fused_state = self._render_and_fuse()
+
+        info = {
+            "distance": current_distance,
+            "captured": captured,
+            "step": self.step_count,
+            "state_info": fused_state,
+        }
+
+        return fused_state.features, reward, terminated, truncated, info
