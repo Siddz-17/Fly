@@ -1,0 +1,5 @@
+condition,condition_name,hs_v_pref_mv,hs_v_null_mv,hs_delta_mv,hs_dsi,vs_v_pref_mv,vs_v_null_mv,vs_delta_mv,vs_dsi
+real,Real Connectome (Push-Pull ACh + GABA),2.288,2.118,0.17,0.0386,0.051,0.073,-0.021,-0.1716
+no_inhibition,No Inhibition (LPi Ablated),3.727,3.611,0.116,0.0158,0.956,1.215,-0.26,-0.1196
+shuffled_weights,Shuffled Weights Control,4.048,3.907,0.142,0.0178,0.193,0.107,0.086,0.2882
+scrambled_topology,Scrambled Topology Control,4.4,3.593,0.807,0.101,89.541,86.411,3.13,0.0178

@@ -194,3 +194,53 @@ class ConnectomeMotionExtractor:
         fig.savefig(out_path, dpi=200, facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
         return out_path
+
+
+class LPTCMotionExtractor:
+    """
+    Extracts biological wide-field ego-motion embeddings directly from
+    downstream Lobula Plate Tangential Cells (HSN, HSE, HSS, VS) and LPi interneurons.
+    """
+
+    def __init__(self, lptc_circuit_data: dict[str, Any]):
+        from connectome.lptc_dynamics import LPTCDynamics
+        self.dynamics = LPTCDynamics(lptc_circuit_data)
+        self.t4_t5_bodies = [
+            int(b) for b, info in lptc_circuit_data["neurons"].items()
+            if any(info["cell_type"].startswith(x) for x in ["T4", "T5"])
+        ]
+
+    def extract_from_t4_t5_rates(
+        self,
+        t4_t5_rates: dict[int, float],
+        time_ms: float = 0.0,
+    ) -> MotionEmbedding:
+        """
+        Computes motion embedding using LPTC membrane potentials.
+        """
+        lptc_out = self.dynamics.step_from_t4_t5_rates(t4_t5_rates)
+
+        # Graded potentials:
+        # HS encodes horizontal motion (yaw/progressive vs regressive)
+        vx = lptc_out["v_hs_mean"]
+        # VS encodes vertical motion (downward vs upward)
+        vy = -lptc_out["v_vs_mean"]  # convention: downward is -vy, upward is +vy
+
+        speed = float(np.sqrt(vx**2 + vy**2))
+
+        # T4 / T5 power sums
+        on_power = sum(r for bid, r in t4_t5_rates.items() if bid in self.dynamics.bid_to_idx and self.dynamics.cell_types[self.dynamics.bid_to_idx[bid]].startswith("T4"))
+        off_power = sum(r for bid, r in t4_t5_rates.items() if bid in self.dynamics.bid_to_idx and self.dynamics.cell_types[self.dynamics.bid_to_idx[bid]].startswith("T5"))
+
+        return MotionEmbedding(
+            time_ms=time_ms,
+            vx=vx,
+            vy=vy,
+            speed=speed,
+            loom=0.0,
+            on_power=float(on_power),
+            off_power=float(off_power),
+            spatial_field_vx=np.array([vx]),
+            spatial_field_vy=np.array([vy]),
+        )
+
