@@ -16,6 +16,7 @@ Adheres strictly to [ENGINEERED FROM REAL CONNECTOME] taxonomy.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -174,29 +175,36 @@ class CircuitDynamics:
     def step(self, external_current: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Advance circuit simulation by one timestep dt.
+        Substeps internally if dt > 2.0 ms to ensure numerical stability.
 
         external_current: array (n_neurons,) injected input (e.g. from Lamina).
         Returns:
             (v, r): membrane potential (mV) and instantaneous firing rate.
         """
-        # Update fast synaptic filter
-        alpha_fast = self.dt / self.tau_fast
-        r_current = np.maximum(0.0, (self.v - self.v_rest) / 10.0)  # Rate approximation
-        self.s_fast += alpha_fast * (r_current - self.s_fast)
+        # Internal substeps to guarantee stability (dt_sub <= 2.0 ms)
+        n_sub = max(1, int(math.ceil(self.dt / 2.0)))
+        dt_sub = self.dt / n_sub
 
-        # Update delayed synaptic filter
-        alpha_delayed = self.dt / self.tau_delayed
-        self.s_delayed += alpha_delayed * (r_current - self.s_delayed)
+        alpha_fast = 1.0 - math.exp(-dt_sub / self.tau_fast)
+        alpha_delayed = 1.0 - math.exp(-dt_sub / self.tau_delayed)
+        decay_mem = 1.0 - math.exp(-dt_sub / self.tau_mem)
 
-        # Presynaptic source vector: delayed for Mi9/Mi4/Tm9, fast for Mi1/Tm1/Tm2
-        s_pre = np.where(self.is_delayed_pre, self.s_delayed, self.s_fast)
+        for _ in range(n_sub):
+            r_current = np.maximum(0.0, (self.v - self.v_rest) / 10.0)
+            self.s_fast += alpha_fast * (r_current - self.s_fast)
+            self.s_delayed += alpha_delayed * (r_current - self.s_delayed)
 
-        # Synaptic current into each postsynaptic neuron: I_syn = W^T @ s_pre
-        synaptic_input = self.weights.T @ s_pre
+            # Presynaptic source vector: delayed for Mi9/Mi4/Tm9, fast for Mi1/Tm1/Tm2
+            s_pre = np.where(self.is_delayed_pre, self.s_delayed, self.s_fast)
 
-        # Membrane equation: tau_m * dV/dt = -(V - V_rest) + I_syn + I_ext
-        dv = (-(self.v - self.v_rest) + synaptic_input + external_current) * (self.dt / self.tau_mem)
-        self.v += dv
+            # Synaptic current into each postsynaptic neuron: I_syn = W^T @ s_pre
+            synaptic_input = self.weights.T @ s_pre
+
+            # Membrane equation: tau_m * dV/dt = -(V - V_rest) + I_syn + I_ext
+            dv = (-(self.v - self.v_rest) + synaptic_input + external_current) * decay_mem
+            self.v += dv
+            # Biological membrane potential limits (-90 mV to +40 mV)
+            np.clip(self.v, -90.0, 40.0, out=self.v)
 
         rates = np.maximum(0.0, (self.v - self.v_rest) / 10.0)
         return self.v.copy(), rates

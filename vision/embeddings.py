@@ -16,6 +16,7 @@ Produces the biological motion embedding vector e_t for downstream fusion.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -99,15 +100,15 @@ class ConnectomeMotionExtractor:
         # T4c/T5c: Up (+y), T4d/T5d: Down (-y)
         vx_on = mean_rates["T4a"] - mean_rates["T4b"]
         vx_off = mean_rates["T5a"] - mean_rates["T5b"]
-        vx = vx_on + vx_off
+        vx = float(np.clip(vx_on + vx_off, -50.0, 50.0))
 
         vy_on = mean_rates["T4c"] - mean_rates["T4d"]
         vy_off = mean_rates["T5c"] - mean_rates["T5d"]
-        vy = vy_on + vy_off
+        vy = float(np.clip(vy_on + vy_off, -50.0, 50.0))
 
-        speed = float(np.sqrt(vx**2 + vy**2))
-        on_power = sum(mean_rates[f"T4{s}"] for s in ["a", "b", "c", "d"])
-        off_power = sum(mean_rates[f"T5{s}"] for s in ["a", "b", "c", "d"])
+        speed = float(math.hypot(vx, vy))
+        on_power = float(np.clip(sum(mean_rates[f"T4{s}"] for s in ["a", "b", "c", "d"]), 0.0, 500.0))
+        off_power = float(np.clip(sum(mean_rates[f"T5{s}"] for s in ["a", "b", "c", "d"]), 0.0, 500.0))
 
         # Spatial vector field approximation across columns
         # Uniform global component projected onto local column vectors + radial divergence
