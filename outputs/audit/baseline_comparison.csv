@@ -1,0 +1,4 @@
+condition,T4a_DSI,T4b_DSI,T4c_DSI,T4d_DSI,Mean_T4_DSI
+real,0.0636,-0.116,-0.0514,-0.0362,-0.035
+shuffled_weights,0.0097,-0.0088,-0.0008,-0.0513,-0.0128
+scrambled_topology,0.0445,-0.0265,-0.1078,-0.0205,-0.0275
